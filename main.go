@@ -1,24 +1,28 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
 	"slices"
+	"strings"
 	"sync"
 )
 
 const maxSegmentLength = 100
 const maxBuckets = 10_000
 
-var runners = runtime.NumCPU()
-var bufferSize = os.Getpagesize() * 1024 * 8
-var wg sync.WaitGroup
+var runners = runtime.NumCPU() - 1
+var bufferSize = os.Getpagesize() * 1024 * 8 // read 8K pages at a time
+var readerWg sync.WaitGroup
+var resultWg sync.WaitGroup
 
 type Measurement struct {
 	Max   int
@@ -27,7 +31,7 @@ type Measurement struct {
 	Total int64
 }
 
-func (m Measurement) AddValue(v int) {
+func (m *Measurement) AddValue(v int) {
 	m.Count++
 	m.Total += int64(v)
 	if v > m.Max {
@@ -44,7 +48,6 @@ var memprofile = flag.String("memprofile", "", "write memory profile to `file`")
 var executionprofile = flag.String("execprofile", "", "write tarce execution to `file`")
 
 func main() {
-
 	flag.Parse()
 
 	if *executionprofile != "" {
@@ -89,85 +92,76 @@ func main() {
 }
 
 func doWork(input io.Reader) {
-	fmt.Printf("runners=%d, buffer-size=%d\n", runners, bufferSize)
-
-	replyChan := make(chan map[string]Measurement, runners)
-	inputChunkChannel := make(chan []byte, runners)
-
-	for i := 0; i < runners; i++ {
-		wg.Add(1)
-		go func() {
-			fmt.Println("chunk worker started")
-			for d := range inputChunkChannel {
-				handleChunk2(d, replyChan)
+	replyChan := make(chan map[string]*Measurement, 5000)
+	resultWg.Add(1)
+	// start the result handler
+	go func() {
+		store := make(map[string]Measurement, maxBuckets)
+		for partialStore := range replyChan {
+			for k, v := range partialStore {
+				if m, ok := store[k]; ok {
+					m.Count += v.Count
+					m.Total += v.Total
+					if v.Max > m.Max {
+						m.Max = v.Max
+					}
+					if v.Min < m.Min {
+						m.Min = v.Min
+					}
+				} else {
+					store[k] = *v
+				}
 			}
-			fmt.Println("chunk worker done")
-			wg.Done()
+		}
+		handleResults(store)
+		resultWg.Done()
+	}()
+
+	ncfr := NewNoCopyFileReader(input, '\n')
+	for i := 0; i < runners; i++ {
+		readerWg.Add(1)
+		go func() {
+			for {
+				d := make([]byte, bufferSize+maxSegmentLength)
+				n, err := ncfr.Read(d)
+				if n == 0 {
+					break
+				}
+				if err != nil {
+					panic(err)
+				}
+				handleChunk(d, replyChan)
+			}
+			readerWg.Done()
 		}()
 	}
 
-	go func() {
-		fmt.Println("reader started")
-		ncfr := NewNoCopyFileReader(input, '\n')
-		_ = ncfr.ChunkToChan(bufferSize+maxSegmentLength, inputChunkChannel)
-		fmt.Println("reader done")
-		close(inputChunkChannel)
-		wg.Wait()
-		close(replyChan)
-	}()
+	readerWg.Wait()
+	close(replyChan)
+	resultWg.Wait()
 
-	fmt.Println("waiting for results")
-	store := make(map[string]Measurement, maxBuckets)
-	for partialStore := range replyChan {
-		for k, v := range partialStore {
-			if m, ok := store[k]; ok {
-				m.Count += v.Count
-				m.Total += v.Total
-				if v.Max > m.Max {
-					m.Max = v.Max
-				}
-				if v.Min < m.Min {
-					m.Min = v.Min
-				}
-			} else {
-				store[k] = v
-			}
-		}
-	}
-
-	fmt.Println("Results:")
-	keys := make([]string, 0, len(store))
-	for k := range store {
-		keys = append(keys, k)
-	}
-	slices.Sort(keys)
-	for _, k := range keys {
-		v := store[k]
-		fmt.Printf("%s: count=%d, min=%d, max=%d, avg=%d\n", k, v.Count, v.Min, v.Max, v.Total/int64(v.Count))
-	}
 }
 
-func handleChunk2(d []byte, result chan map[string]Measurement) {
-	s := make(map[string]Measurement, 1000)
+func handleChunk(d []byte, result chan map[string]*Measurement) {
+	s := make(map[string]*Measurement, 1000)
 	pos := 0
 	lineStartPos := pos
 	delPos := -1
 
-	name := ""
+	var name []byte
 	for pos < len(d) {
 		switch d[pos] {
 		case ';':
 			delPos = pos
-			name = string(d[lineStartPos:pos])
+			name = d[lineStartPos:pos]
 		case '\n':
 			lineStartPos = pos + 1 // start of next line
 			// do end of line processing
-			value := parseInt2(d[delPos+1 : pos])
-			if m, ok := s[name]; ok {
+			value := parseInt(d[delPos+1 : pos])
+			if m, ok := s[string(name)]; ok {
 				m.AddValue(value)
-				s[name] = m
 			} else {
-				s[name] = Measurement{Max: value, Min: value, Count: 1, Total: int64(value)}
+				s[string(name)] = &Measurement{Max: value, Min: value, Count: 1, Total: int64(value)}
 			}
 		}
 		pos++
@@ -175,8 +169,22 @@ func handleChunk2(d []byte, result chan map[string]Measurement) {
 	result <- s
 }
 
-func parseInt2(in []byte) int {
-	v := 0
+func handleResults(m map[string]Measurement) {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	var sb strings.Builder
+	for _, k := range keys {
+		v := m[k]
+		sb.WriteString(fmt.Sprintf("%s=%.1f/%.1f/%.1f, ", k, tenthFloat(v.Min), tenthFloat(v.Max), tenthFloat(int(v.Total/int64(v.Count)))))
+	}
+	fmt.Println("{" + sb.String()[:sb.Len()-2] + "}")
+}
+
+func parseInt(in []byte) int {
+	var v = 0
 	negative := false
 	if in[0] == '-' {
 		negative = true
@@ -192,4 +200,51 @@ func parseInt2(in []byte) int {
 		return -v
 	}
 	return v
+}
+
+func tenthFloat(in int) float64 {
+	return math.Round(float64(in)) / 10
+}
+
+// NoCopyFileReader is a file reader that does not copy the buffer
+type NoCopyFileReader struct {
+	sync.Mutex
+	r         io.Reader
+	leftover  []byte
+	delimiter byte
+}
+
+func NewNoCopyFileReader(r io.Reader, delimiter byte) *NoCopyFileReader {
+	return &NoCopyFileReader{r: r, delimiter: delimiter}
+}
+
+func (ncfr *NoCopyFileReader) Read(d []byte) (int, error) {
+	ncfr.Lock()
+	defer ncfr.Unlock()
+
+	offset := 0
+	if len(ncfr.leftover) > 0 {
+		copy(d, ncfr.leftover)
+		offset = len(ncfr.leftover)
+		ncfr.leftover = nil
+	}
+
+	n, err := ncfr.r.Read(d[offset : len(d)-maxSegmentLength])
+	if err != nil {
+		return n, err
+	}
+	n += offset
+
+	if d[n-1] != ncfr.delimiter { // not complete line
+		// find the last delimiter
+		lastDelimiter := bytes.LastIndexByte(d[:n], ncfr.delimiter)
+		if lastDelimiter == -1 {
+			return n, fmt.Errorf("'%s' delimiter not found in the buffer", string(ncfr.delimiter))
+		}
+		ncfr.leftover = make([]byte, n-lastDelimiter-1)
+		copy(ncfr.leftover, d[lastDelimiter+1:n]) // copy the leftover
+		n = lastDelimiter + 1
+		d = d[0:n]
+	}
+	return n, nil
 }
